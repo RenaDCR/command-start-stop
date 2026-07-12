@@ -1,5 +1,6 @@
 import { RestEndpointMethodTypes } from "@octokit/plugin-rest-endpoint-methods";
 import ms from "ms";
+import { QUERY_PULL_REQUEST_REVIEW_THREADS } from "../github-queries";
 import { Context } from "../types/context";
 import { AssignedIssue, GitHubIssueSearch, PrState, Review } from "../types/payload";
 import { AssignedIssueScope, Role } from "../types/plugin-input";
@@ -240,12 +241,79 @@ async function getReviewByUser(context: Context, pullRequest: Awaited<ReturnType
   return latestReviewsByUser;
 }
 
-async function shouldSkipPullRequest(
+type ReviewThreadQuery = {
+  repository?: {
+    pullRequest?: {
+      reviewThreads?: {
+        nodes?: {
+          isResolved?: boolean;
+          comments?: {
+            nodes?: {
+              author?: { login?: string | null } | null;
+              createdAt?: string | null;
+            }[];
+          } | null;
+        }[];
+      } | null;
+    } | null;
+  } | null;
+};
+
+const REVIEWER_LAG_TIMEOUT = "24 Hours";
+
+function isElapsed(createdAt: string | null | undefined, tolerance: string) {
+  if (!createdAt) {
+    return false;
+  }
+  return new Date().getTime() - new Date(createdAt).getTime() >= getTimeValue(tolerance);
+}
+
+async function getUnresolvedReviewThreads(context: Context, owner: string, repo: string, pullNumber: number) {
+  try {
+    const response = await context.octokit.graphql.paginate<ReviewThreadQuery>(QUERY_PULL_REQUEST_REVIEW_THREADS, {
+      owner,
+      repo,
+      pull_number: pullNumber,
+    });
+    const threads = response.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+    return threads.filter((thread) => thread && !thread.isResolved);
+  } catch (err) {
+    context.logger.debug("Could not inspect pull request review threads.", { error: err as Error, owner, repo, pullNumber });
+    return null;
+  }
+}
+
+async function isReviewerLaggedAfterAuthorResponse(
+  context: Context,
+  pullRequest: Awaited<ReturnType<typeof getOpenedPullRequestsForUser>>[0],
+  latestReviews: Review[],
+  { owner, repo }: { owner: string; repo: string },
+  username: string
+) {
+  const unresolvedThreads = await getUnresolvedReviewThreads(context, owner, repo, pullRequest.number);
+  if (!unresolvedThreads) {
+    return false;
+  }
+
+  if (unresolvedThreads.length === 0) {
+    const latestReview = latestReviews[0];
+    return isElapsed(latestReview?.submitted_at, REVIEWER_LAG_TIMEOUT);
+  }
+
+  return unresolvedThreads.every((thread) => {
+    const lastComment = thread.comments?.nodes?.[0];
+    const authorLogin = lastComment?.author?.login?.toLowerCase();
+    return authorLogin === username.toLowerCase() && isElapsed(lastComment?.createdAt, REVIEWER_LAG_TIMEOUT);
+  });
+}
+
+async function shouldCreditPullRequestForTaskLimit(
   context: Context,
   pullRequest: Awaited<ReturnType<typeof getOpenedPullRequestsForUser>>[0],
   reviews: Awaited<ReturnType<typeof getReviewByUser>>,
   { owner, repo, issueNumber }: { owner: string; repo: string; issueNumber: number },
-  reviewDelayTolerance: string
+  reviewDelayTolerance: string,
+  username: string
 ) {
   const timeline = await context.octokit.paginate(context.octokit.rest.issues.listEventsForTimeline, {
     owner,
@@ -255,25 +323,31 @@ async function shouldSkipPullRequest(
   const reviewEvent = timeline.filter((o) => o.event === "review_requested").pop();
   const referenceTime = reviewEvent && "created_at" in reviewEvent ? new Date(reviewEvent.created_at).getTime() : new Date(pullRequest.created_at).getTime();
 
-  // If no reviews exist, check time reference
+  // A stale PR with no review should not block more work.
   if (reviews.size === 0) {
     return new Date().getTime() - referenceTime >= getTimeValue(reviewDelayTolerance);
   }
 
-  // If changes are requested, do not skip
-  if (Array.from(reviews.values()).some((review) => review.state === "CHANGES_REQUESTED")) {
-    return true;
+  const latestReviews = Array.from(reviews.values()).sort((a, b) => {
+    if (!a?.submitted_at || !b?.submitted_at) {
+      return 0;
+    }
+    return new Date(b.submitted_at).getTime() - new Date(a.submitted_at).getTime();
+  });
+
+  if (latestReviews.some((review) => review.state === "CHANGES_REQUESTED")) {
+    return isReviewerLaggedAfterAuthorResponse(context, pullRequest, latestReviews, { owner, repo }, username);
   }
 
-  // If no approvals exist or time reference has exceeded review delay tolerance
-  const hasApproval = Array.from(reviews.values()).some((review) => review.state === "APPROVED");
+  const hasApproval = latestReviews.some((review) => review.state === "APPROVED");
   const isTimePassed = new Date().getTime() - referenceTime >= getTimeValue(reviewDelayTolerance);
 
-  return hasApproval || !isTimePassed;
+  return hasApproval || isTimePassed;
 }
 
 /**
- * Returns all the pull-requests pending approval, which count negatively against the PR author's quota.
+ * Returns open pull requests that should offset task-limit checks because they are approved,
+ * stale without review, or blocked on reviewer follow-up after the author responded.
  */
 export async function getPendingOpenedPullRequests(context: Context, username: string) {
   const { reviewDelayTolerance } = context.config;
@@ -287,14 +361,15 @@ export async function getPendingOpenedPullRequests(context: Context, username: s
     if (!openedPullRequest) continue;
     const { owner, repo } = getOwnerRepoFromHtmlUrl(openedPullRequest.html_url);
     const latestReviewsByUser = await getReviewByUser(context, openedPullRequest);
-    const shouldSkipPr = await shouldSkipPullRequest(
+    const shouldCreditPr = await shouldCreditPullRequestForTaskLimit(
       context,
       openedPullRequest,
       latestReviewsByUser,
       { owner, repo, issueNumber: openedPullRequest.number },
-      reviewDelayTolerance
+      reviewDelayTolerance,
+      username
     );
-    if (!shouldSkipPr) {
+    if (shouldCreditPr) {
       result.push(openedPullRequest);
     }
   }
